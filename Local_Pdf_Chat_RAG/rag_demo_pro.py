@@ -30,7 +30,7 @@ SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 SEARCH_ENGINE = "google"
 RERANK_METHOD = os.getenv("RERANK_METHOD", "cross_encoder")
 SILICONFLOW_API_KEY = os.getenv("SILICONFLOW_API_KEY")
-SILICONFLOW_API_KEY = "sk-hjolxqxzjpqflkuivczwqujgtrmylaqocfliqdzsyszoqcia"
+SILICONFLOW_API_KEY = ""
 SILICONFLOW_API_URL = os.getenv("SILICONFLOW_API_URL", "https://api.siliconflow.cn/v1/chat/completions")
 
 # 配置请求重试
