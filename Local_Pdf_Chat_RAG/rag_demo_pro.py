@@ -46,6 +46,14 @@ faiss_index = None
 faiss_contents_map = {}  # original_id -> content
 faiss_metadatas_map = {} # original_id -> metadata
 faiss_id_order_for_index = []
+docid_to_chunkids_map = {}  # 新增：记录每个 PDF 文件的 doc_id 对应的所有 chunk_id
+
+# -------- 全局容器（第 i 个元素 ↔ 第 i 个文档） --------
+faiss_indices_list        = []   # List[faiss.Index]
+contents_maps_list        = []   # List[Dict[chunk_id, text]]
+metadatas_maps_list       = []   # List[Dict[chunk_id, metadata]]
+docid_to_chunkids_maps    = []   # List[Dict[doc_id, List[chunk_id]]]
+
 
 # 初始化交叉编码器
 cross_encoder = None
@@ -241,13 +249,40 @@ def recursive_retrieval(initial_query, max_iterations=3, enable_web_search=False
             
         if current_contexts_for_llm: # Use combined web and local context for deciding next query
             current_summary = "\\n".join(current_contexts_for_llm[:3]) if current_contexts_for_llm else "未找到相关信息"
-            
-            next_query_prompt = f"""基于原始问题: {initial_query}
+            # 你的查询要求技巧如下：
+            # - 可以尝试直接去使用原始问题的核心词汇或者概念作为新查询
+            # - 如果是原始问题询问的是具体概念或者信息，可以使用较短的查询词
+            # - 尝试使用不同角度或更具体的关键词
+            # - 使用陈述查询而非问句查询
+            # - 合理推断答案周围存在的关键词，例如询问时间应该有“年”“月”“日”等关键词
+            # 例如：
+            # 1.
+            # 江西省木林森照明有限公司废水处理及回用工程(吉安)的处理水量是每天多少立方米？
+            # 分析：如果要给出新查询，原始问题询问的就是处理水量，所以新查询可以是：江西省木林森照明有限公司处理水量。
+            # 2.
+            # 在JDL - 重金属废水处理及资源回收技术中，铜陵PCB产业园污水处理工程是从什么时候开始的？
+            # 分析：如果要给出新查询，原始问题询问的就是污水处理工程的开始时间，所以新查询可以是：铜陵PCB产业园污水处理工程年，月，日，。
+            next_query_prompt = f"""
+            基于原始问题: {initial_query}
 以及已检索信息: 
 {current_summary}
 
-分析是否需要进一步查询。如果需要，请提供新的查询问题，使用不同角度或更具体的关键词。
+分析是否需要进一步查询。如果需要，请提供新的查询问题,尝试使用不同角度或更具体的关键词。
 如果已经有充分信息，请回复'不需要进一步查询'。
+
+            # 你的查询要求技巧如下：
+            # - 可以尝试直接去使用原始问题的核心词汇或者概念作为新查询
+            # - 如果是原始问题询问的是具体概念或者信息，可以使用较短的查询词
+            # - 尝试使用不同角度或更具体的关键词
+            # - 使用陈述查询而非问句查询
+            # - 合理推断答案周围存在的关键词，例如询问时间应该有“年”“月”“日”等关键词
+            # 例如：
+            # 1.
+            # 江西省木林森照明有限公司废水处理及回用工程(吉安)的处理水量是每天多少立方米？
+            # 分析：如果要给出新查询，原始问题询问的就是处理水量，所以新查询可以是：江西省木林森照明有限公司处理水量。
+            # 2.
+            # 在JDL - 重金属废水处理及资源回收技术中，铜陵PCB产业园污水处理工程是从什么时候开始的？
+            # 分析：如果要给出新查询，原始问题询问的就是污水处理工程的开始时间，所以新查询可以是：铜陵PCB产业园污水处理工程年，月，日，。
 
 新查询(如果需要):"""
             
@@ -413,6 +448,54 @@ def extract_text(filepath):
 
 
 from pathlib import Path
+
+def process_single_pdf(file_path: str) -> int:
+    """
+    读取一个 PDF，切分、嵌入并为其创建独立的 FAISS 索引。
+    返回该文档在全局列表中的下标 i（即可用 faiss_indices_list[i] 访问）。
+    """
+    pdf_path  = Path(file_path)
+    file_name = pdf_path.name
+
+    # 提取文本
+    text = extract_text(str(pdf_path))
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=400,
+        chunk_overlap=40,
+        separators=["\n\n", "\n", "。", "，", "；", "：", " ", ""]
+    )
+    chunks = text_splitter.split_text(text)
+    if not chunks:
+        raise ValueError(f"{file_name} 无可用文本")
+
+    # 生成唯一 doc_id、chunk_id
+    timestamp = int(time.time())
+    doc_id    = f"doc_{timestamp}"
+    chunk_ids = [f"{doc_id}_chunk_{i}" for i in range(len(chunks))]
+    metadatas = [{"source": file_name, "doc_id": doc_id} for _ in chunks]
+
+    # 生成嵌入并建立本地 FAISS
+    embeddings_np = np.array(EMBED_MODEL.encode(chunks, show_progress_bar=False)).astype("float32")
+    dimension     = embeddings_np.shape[1]
+    index         = faiss.IndexFlatL2(dimension)
+    index.add(embeddings_np)
+
+    # 构建映射
+    contents_map       = {cid: chunk for cid, chunk in zip(chunk_ids, chunks)}
+    metadatas_map      = {cid: meta  for cid, meta  in zip(chunk_ids, metadatas)}
+    doc_chunkid_map    = {doc_id: chunk_ids}
+
+    # 把本次结果 append 到全局列表
+    faiss_indices_list.append(index)
+    contents_maps_list.append(contents_map)
+    metadatas_maps_list.append(metadatas_map)
+    docid_to_chunkids_maps.append(doc_chunkid_map)
+
+    i = len(faiss_indices_list) - 1        # 当前文档的索引号
+    logging.info(f"📄 {file_name}: 建立单独向量库完成 → faiss_indices_list[{i}]")
+    return i
+
+
 def process_multiple_pdfs(files):
     """处理多个PDF文件"""
     if not files:
@@ -421,7 +504,7 @@ def process_multiple_pdfs(files):
     try:
         # 清空向量数据库和相关存储
         # progress(0.1, desc="清理历史数据...")
-        global faiss_index, faiss_contents_map, faiss_metadatas_map, faiss_id_order_for_index
+        global faiss_index, faiss_contents_map, faiss_metadatas_map, faiss_id_order_for_index, docid_to_chunkids_map
         faiss_index = None
         faiss_contents_map = {}
         faiss_metadatas_map = {}
@@ -471,7 +554,9 @@ def process_multiple_pdfs(files):
                 all_new_chunks.extend(chunks)
                 all_new_metadatas.extend(current_file_metadatas)
                 all_new_original_ids.extend(current_file_ids)
-                
+                docid_to_chunkids_map[doc_id] = current_file_ids
+
+
                 total_chunks += len(chunks)
                 file_processor.update_status(file_name, "处理完成", len(chunks))
                 processed_results.append(f"✅ {file_name}: 成功处理 {len(chunks)} 个文本块")
@@ -507,7 +592,7 @@ def process_multiple_pdfs(files):
         update_bm25_index() # This will need to use faiss_contents_map
         
         file_list = file_processor.get_file_list()
-        
+        print(docid_to_chunkids_map)
         return "\n".join(processed_results), file_list
         
     except Exception as e:
@@ -1012,7 +1097,7 @@ def call_siliconflow_api(prompt, temperature=0.7, max_tokens=1024):
         }
 
         headers = {
-            "Authorization": f"Bearer <你的api>", # 从环境变量获取密钥
+            "Authorization": f"Bearer <apikey>", # 从环境变量获取密钥
             "Content-Type": "application/json; charset=utf-8" # 明确指定编码
         }
 
@@ -1058,64 +1143,7 @@ def call_siliconflow_api(prompt, temperature=0.7, max_tokens=1024):
 
 from openai import OpenAI
 
-# def call_siliconflow_api(prompt, temperature=0.7, max_tokens=1024, model="Pro/deepseek-ai/DeepSeek-R1"):
-#     """
-#     调用SiliconFlow API获取回答（非流式响应）
-    
-#     Args:
-#         prompt: 提示词
-#         temperature: 温度参数
-#         max_tokens: 最大生成token数
-#         model: 使用的模型名称
-        
-#     Returns:
-#         生成的回答文本（包含可能的思维链内容）
-#     """
-#     # 检查是否配置了SiliconFlow API密钥
-#     if not SILICONFLOW_API_KEY:
-#         logging.error("未设置 SILICONFLOW_API_KEY 环境变量。请在.env文件中设置您的 API 密钥。")
-#         return "错误：未配置 SiliconFlow API 密钥。", ""
 
-#     try:
-#         # 创建OpenAI风格的客户端
-#         client = OpenAI(
-#             api_key=SILICONFLOW_API_KEY,
-#             base_url=SILICONFLOW_API_URL
-#         )
-        
-#         # 创建非流式请求
-#         response = client.chat.completions.create(
-#             model=model,
-#             messages=[
-#                 {"role": "user", "content": prompt}
-#             ],
-#             stream=False,  # 非流式响应
-#             max_tokens=max_tokens,
-#             temperature=temperature,
-#             top_p=0.7,
-#             # top_k=50,
-#             frequency_penalty=0.5
-#         )
-        
-#         # 处理响应
-#         if response.choices and len(response.choices) > 0:
-#             message = response.choices[0].message
-#             content = message.content or ""
-            
-#             # 尝试获取思维链内容（如果API支持）
-#             reasoning = ""
-#             if hasattr(message, 'reasoning_content') and message.reasoning_content:
-#                 reasoning = message.reasoning_content
-            
-#             # 返回格式：(回答内容, 思维链内容)
-#             return content, reasoning
-    
-#     except Exception as e:
-#         logging.error(f"调用SiliconFlow API时出错: {str(e)}")
-#         return f"API调用错误: {str(e)}", ""
-    
-#     # 默认返回空结果
-#     return "", ""
 
 def hybrid_merge(semantic_results, bm25_results, alpha=0.7):
     """
@@ -1453,13 +1481,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="本地RAG问答系统")
     parser.add_argument("--files", nargs="+", help="PDF文件路径列表")
     parser.add_argument("--web-search", action="store_true", help="启用网络搜索")
-    parser.add_argument("--model", choices=["ollama", "siliconflow"], default="ollama", help="选择使用的模型")
+    parser.add_argument("--model", choices=["ollama", "siliconflow"], default="siliconflow", help="选择使用的模型")
     
     args = parser.parse_args()
     if args.files:
         process_multiple_pdfs(args.files)
-
-    process_chat("请帮我找到国家环境保护工业废水污染控制工程技术中心负责人的邮箱", None , False,"siliconflow")
+    print(docid_to_chunkids_map)
+    # process_chat("在污酸废水气液强化硫化处理与资源化技术中，紫金铜业项目的人力成本是每立方米多少元？", None , False,"siliconflow")
     # if not check_environment():
     #     print("环境检查失败，请确保Ollama服务已启动")
     #     exit(1)
