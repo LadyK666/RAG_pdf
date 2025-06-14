@@ -111,6 +111,7 @@ HiRAG/
 ├── docs/                   # 文档目录
 ├── case/                   # 案例目录
 ├── imgs/                   # 图片资源目录
+├── 1.txt/                  # 知识文档txt版，和dataset文件夹里的相同
 └── your_work_dir/          # 工作目录
 
 Local_Pdf_Chat_RAG/
